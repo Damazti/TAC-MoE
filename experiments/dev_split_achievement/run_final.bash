@@ -29,8 +29,9 @@ P1_WD="${P1_WD:-0.01}"
 P1_BS="${P1_BS:-16}"
 P1_GRAD_ACCUM="${P1_GRAD_ACCUM:-4}"
 P1_MAX_STEPS="${P1_MAX_STEPS:-400}"
-P1_SAVE_STEPS="${P1_SAVE_STEPS:-60}"
-P1_EVAL_STEPS="${P1_EVAL_STEPS:-60}"
+P1_SAVE_STEPS="${P1_SAVE_STEPS:-30}"
+P1_EVAL_STEPS="${P1_EVAL_STEPS:-30}"
+P1_EVAL_DELAY="${P1_EVAL_DELAY:-300}"
 P1_SAVE_TOTAL_LIMIT="${P1_SAVE_TOTAL_LIMIT:-6}"
 P1_USE_ACHIEVEMENT_LOSS="${P1_USE_ACHIEVEMENT_LOSS:-0}"
 P1_ACH_TARGETS="${P1_ACH_TARGETS:-IHD:0.81,IACV2:0.845}"
@@ -40,9 +41,10 @@ P2_LR="${P2_LR:-5e-4}"
 P2_WD="${P2_WD:-0}"
 P2_BS="${P2_BS:-16}"
 P2_GRAD_ACCUM="${P2_GRAD_ACCUM:-1}"
-P2_MAX_STEPS="${P2_MAX_STEPS:-900}"
+P2_MAX_STEPS="${P2_MAX_STEPS:-500}"
 P2_SAVE_STEPS="${P2_SAVE_STEPS:-30}"
 P2_EVAL_STEPS="${P2_EVAL_STEPS:-30}"
+P2_EVAL_DELAY="${P2_EVAL_DELAY:-300}"
 P2_SAVE_TOTAL_LIMIT="${P2_SAVE_TOTAL_LIMIT:-6}"
 P2_VALIDATION_SPLIT="${P2_VALIDATION_SPLIT:-dev}"
 P2_SEMEVAL_DEV_RATIO="${P2_SEMEVAL_DEV_RATIO:-}"
@@ -56,6 +58,12 @@ ACH_MARGIN="${ACH_MARGIN:-1.0}"
 ACH_EMA="${ACH_EMA:-0.3}"
 ACH_WARMUP_RATIO="${ACH_WARMUP_RATIO:-0.6}"
 P2_WEIGHT_FLOOR="${P2_WEIGHT_FLOOR:-0}"
+P2_REPLAY_RATIO="${P2_REPLAY_RATIO:-1}"
+IHD_RATIO="${IHD_RATIO:-0.8}"
+IACV2_RATIO="${IACV2_RATIO:-0.6}"
+P2_REPLAY_TAG="${P2_REPLAY_TAG:-ihd08_iac06}"
+P2_TASK_MEMORY_RATIOS="${P2_TASK_MEMORY_RATIOS:-IHD:${IHD_RATIO},IACV2:${IACV2_RATIO}}"
+P2_USE_EXPERIENCE_REPLAY="${P2_USE_EXPERIENCE_REPLAY:-1}"
 
 RUN_PHASE1="${RUN_PHASE1:-1}"
 RUN_PHASE2="${RUN_PHASE2:-1}"
@@ -90,6 +98,39 @@ split_train_dev() {
         --ratio "$4" \
         --seed "$SEED" \
         --stratify_fields task_dataset,target
+}
+
+build_phase2_experience_replay() {
+    local data_dir="$1"
+    local source_train="$data_dir/phase2/train_joint.json"
+    local output_train="$data_dir/phase2/train.json"
+
+    if [ "$P2_USE_EXPERIENCE_REPLAY" = "0" ]; then
+        return
+    fi
+
+    cp "$output_train" "$source_train"
+    log "Building Phase 2 experience replay train file: $P2_TASK_MEMORY_RATIOS"
+    python experiments/tac_moe/build_experience_replay.py \
+        --combined_file "$source_train" \
+        --new_task SemEval2018 \
+        --task_memory_ratios "$P2_TASK_MEMORY_RATIOS" \
+        --output "$output_train" \
+        --seed "$SEED" | tee "$data_dir/phase2/replay_stats.txt"
+}
+
+remove_checkpoints_before_step() {
+    local output_dir="$1"
+    local min_step="$2"
+    local path step
+
+    for path in "$output_dir"/checkpoint-*; do
+        [ -d "$path" ] || continue
+        step="${path##*-}"
+        if [ "$step" -lt "$min_step" ]; then
+            rm -rf "$path"
+        fi
+    done
 }
 
 select_best_checkpoint() {
@@ -208,6 +249,8 @@ prepare_phase2_data() {
             "$data_dir/phase2/dev.json" \
             "$RATIO" | tee "$data_dir/phase2/split_stats.txt"
     fi
+
+    build_phase2_experience_replay "$data_dir"
 }
 
 run_phase1() {
@@ -256,6 +299,7 @@ run_phase1() {
         --save_steps "$P1_SAVE_STEPS" \
         --save_total_limit "$P1_SAVE_TOTAL_LIMIT" \
         --evaluation_strategy steps \
+        --eval_delay "$P1_EVAL_DELAY" \
         --eval_steps "$P1_EVAL_STEPS" \
         --eval_accumulation_steps 1 \
         --eval_metric_mode macro \
@@ -282,6 +326,8 @@ run_phase1() {
         --logging_dir "$tb_dir" \
         --predict_with_generate
 
+    remove_checkpoints_before_step "$output_dir" "$P1_EVAL_DELAY"
+
     local best_info
     best_info="$(select_best_checkpoint "$output_dir")"
     P1_BEST_STEP="${best_info%%$'\t'*}"
@@ -293,7 +339,7 @@ run_phase1() {
 
 run_phase2() {
     local data_dir="$1"
-    local run_name="${TAG}_phase2_ach_warm${ACH_WARMUP_RATIO}_step${P2_MAX_STEPS}"
+    local run_name="${TAG}_phase2_er_${P2_REPLAY_TAG}_warm${ACH_WARMUP_RATIO}_step${P2_MAX_STEPS}"
     local expanded_ckpt="$WORK_ROOT/saved/expanded/$run_name"
     local output_dir="$WORK_ROOT/saved/$run_name"
     local result_dir="$WORK_ROOT/results/$run_name"
@@ -354,6 +400,7 @@ run_phase2() {
         --save_steps "$P2_SAVE_STEPS" \
         --save_total_limit "$P2_SAVE_TOTAL_LIMIT" \
         --evaluation_strategy steps \
+        --eval_delay "$P2_EVAL_DELAY" \
         --eval_steps "$P2_EVAL_STEPS" \
         --eval_accumulation_steps 1 \
         --eval_metric_mode macro \
@@ -374,7 +421,7 @@ run_phase2() {
         --task_num 3 \
         --expert_num "$EXPERT_NUM" \
         --freeze_expert_ids "$FREEZE_EXPERT_IDS" \
-        --replay_ratio 1 \
+        --replay_ratio "$P2_REPLAY_RATIO" \
         --replay_task_ids "1,2" \
         "${P2_ACH_ARGS[@]}" \
         --lb_loss_coeff 0 \
@@ -383,11 +430,15 @@ run_phase2() {
         --logging_dir "$tb_dir" \
         --predict_with_generate
 
-    local best_info best_step best_ckpt
-    best_info="$(select_best_checkpoint "$output_dir")"
-    best_step="${best_info%%$'\t'*}"
-    best_ckpt="${best_info#*$'\t'}"
-    log "Best Phase 2 checkpoint: step=$best_step path=$best_ckpt"
+    remove_checkpoints_before_step "$output_dir" "$P2_EVAL_DELAY"
+
+    local test_step test_ckpt
+    test_step="$P2_MAX_STEPS"
+    test_ckpt="$output_dir/checkpoint-$P2_MAX_STEPS"
+    if [ ! -d "$test_ckpt" ]; then
+        test_ckpt="$output_dir"
+    fi
+    log "Phase 2 final checkpoint for test: step=$test_step path=$test_ckpt"
 
     if [ "$RUN_PREDICT" != "0" ]; then
         mkdir -p "$result_dir"
@@ -401,7 +452,7 @@ run_phase2() {
             --prompt_column input \
             --response_column target \
             --model_name_or_path "$MODEL" \
-            --peft_path "$best_ckpt" \
+            --peft_path "$test_ckpt" \
             --output_dir "$result_dir" \
             --overwrite_output_dir \
             --max_source_length 1024 \
@@ -421,8 +472,10 @@ run_phase2() {
             --test_data "$data_dir/phase2/test.json" \
             --metric macro | tee "$result_dir/eval_results.txt"
 
-        printf '%s\n' "$best_step" > "$result_dir/best_step.txt"
-        printf '%s\n' "$best_ckpt" > "$result_dir/best_checkpoint.txt"
+        printf '%s\n' "$test_step" > "$result_dir/best_step.txt"
+        printf '%s\n' "$test_ckpt" > "$result_dir/best_checkpoint.txt"
+        printf '%s\n' "$test_step" > "$result_dir/test_step.txt"
+        printf '%s\n' "$test_ckpt" > "$result_dir/test_checkpoint.txt"
         printf '%s\n' "$P1_CKPT" > "$result_dir/p1_checkpoint.txt"
         cp "$data_dir/phase2/task_dataset.json" "$result_dir/task_dataset.phase2.json"
         cp "$output_dir/trainer_state.json" "$result_dir/trainer_state.json" 2>/dev/null || true
@@ -435,8 +488,8 @@ log "Starting final two-stage run"
 log "WORK_ROOT=$WORK_ROOT"
 log "TAG=$TAG RATIO=$RATIO SEED=$SEED"
 log "GPU train=$NUM_GPUS_TRAIN pred=$NUM_GPUS_PRED"
-log "Phase 1: no-ach default=$P1_USE_ACHIEVEMENT_LOSS, steps=$P1_MAX_STEPS"
-log "Phase 2: ach=$P2_USE_ACHIEVEMENT_LOSS, warmup=$ACH_WARMUP_RATIO, floor=$P2_WEIGHT_FLOOR, steps=$P2_MAX_STEPS"
+log "Phase 1: no-ach default=$P1_USE_ACHIEVEMENT_LOSS, steps=$P1_MAX_STEPS, eval_delay=$P1_EVAL_DELAY"
+log "Phase 2: ach=$P2_USE_ACHIEVEMENT_LOSS, warmup=$ACH_WARMUP_RATIO, eval_delay=$P2_EVAL_DELAY, floor=$P2_WEIGHT_FLOOR, replay=$P2_TASK_MEMORY_RATIOS, steps=$P2_MAX_STEPS"
 
 if [ "$RUN_PHASE1" != "0" ]; then
     prepare_phase1_data "$DATA_DIR"
